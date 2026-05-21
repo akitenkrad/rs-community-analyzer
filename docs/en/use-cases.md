@@ -1,17 +1,19 @@
+**English** | [日本語](../ja/use-cases.md)
+
 # Use cases
 
-Concrete scenarios for `community-analyzer`．Every example builds an
+Concrete scenarios for `community-analyzer`. Every example builds an
 [`AnalysisInput`](architecture.md#data-model) from in-memory `Vec`s — there is
-no database and no platform client involved．
+no database and no platform client involved.
 
-See also：[Architecture](architecture.md) ／ [Hypotheses](hypotheses.md) ／
-[NLP backend](nlp.md) ／ [Ethics](ethics.md)．
+See also: [Architecture](architecture.md) / [Hypotheses](hypotheses.md) /
+[NLP backend](nlp.md) / [Ethics](ethics.md).
 
 ## 1. Quick health check
 
 Build the input from in-memory data, compute the Rust-only hypotheses, and
-print the aggregate health score with its flags．`compute_h2` (psychological
-safety) and `compute_h3` (power gradient) need no NLP backend．
+print the aggregate health score with its flags. `compute_h2` (psychological
+safety) and `compute_h3` (power gradient) need no NLP backend.
 
 ```rust
 use chrono::Utc;
@@ -46,14 +48,14 @@ for flag in &summary.red_flags {
 ```
 
 A complete runnable version lives in `examples/basic.rs`
-(`cargo run --example basic`)．
+(`cargo run --example basic`).
 
 ## 2. Full report with NLP
 
 Compute every hypothesis, then enrich the embedding / sentiment / clustering
-fields with a real NLP backend．Note that `compute_h5` takes a
-`&dyn Morphology` (novel-vocabulary extraction)，and the `enrich_*` functions
-take a `&dyn Nlp`．
+fields with a real NLP backend. Note that `compute_h5` takes a
+`&dyn Morphology` (novel-vocabulary extraction), and the `enrich_*` functions
+take a `&dyn Nlp`.
 
 ```rust
 use community_analyzer::{
@@ -85,16 +87,16 @@ println!("health = {:.2}", summary.overall_health_score);
 
 For deterministic, offline CI runs swap `CandleNlp` for `MockNlp` — it
 implements the same `Nlp` trait with no models and no network (see
-[NLP backend](nlp.md))．
+[NLP backend](nlp.md)).
 
 ## 3. Rust-only / offline mode
 
 For environments without network access (CI, air-gapped deployments) you have
-two options．Either build without the NLP feature
+two options. Either build without the NLP feature
 (`--no-default-features --features lindera`) and skip the `enrich_*` step
 entirely — the embedding / sentiment / clustering fields stay `None` — or keep
 the feature on and use `MockNlp`, which is deterministic and never touches the
-network．
+network.
 
 ```rust
 use community_analyzer::{
@@ -110,24 +112,24 @@ enrich_h1(input, &nlp, &mut h1)?;
 ```
 
 Which hypothesis fields are Rust-only vs NLP-enriched is documented in
-[Hypotheses](hypotheses.md)．
+[Hypotheses](hypotheses.md).
 
 ## 4. Adapting a chat platform
 
-The library is platform-agnostic．A caller maps its own records into the four
-input types once．The mapping rules are the same regardless of source
-(Slack / Discord / Teams / …)：
+The library is platform-agnostic. A caller maps its own records into the four
+input types once. The mapping rules are the same regardless of source
+(Slack / Discord / Teams / …):
 
-* **Timestamps** become `chrono::DateTime<Utc>`（platform epoch strings or ISO
-  timestamps are converted by the caller）．
-* **Threading** is expressed through `Message::thread_root_id`：`None` for a
-  top-level message, `Some(root_id)` for a reply（a root may equivalently be
-  encoded as `Some(self.id)`）．
+* **Timestamps** become `chrono::DateTime<Utc>` (platform epoch strings or ISO
+  timestamps are converted by the caller).
+* **Threading** is expressed through `Message::thread_root_id`: `None` for a
+  top-level message, `Some(root_id)` for a reply (a root may equivalently be
+  encoded as `Some(self.id)`).
 * **Reactions** are first-class `Reaction` values (`message_id` + `user_id` +
-  `emoji_name`)，not embedded JSON．
-* **Roles and categories** are pre-resolved by the caller：set `User::role`
+  `emoji_name`), not embedded JSON.
+* **Roles and categories** are pre-resolved by the caller: set `User::role`
   (`Exec` / `Manager` / `Lead` / `Staff` / `Unknown`) and `Channel::category`
-  before handing data to the library．
+  before handing data to the library.
 
 ```rust
 use chrono::Utc;
@@ -163,16 +165,16 @@ let _reaction = Reaction {
 };
 ```
 
-All IDs are opaque strings — the library never parses or assumes their shape，
-so Slack IDs, UUIDs, integer-as-string, and email addresses all work．
+All IDs are opaque strings — the library never parses or assumes their shape,
+so Slack IDs, UUIDs, integer-as-string, and email addresses all work.
 
 ## 5. Generating a report with figures + anonymization
 
-`report::write_comm_report` writes the integrated `report.md`；
+`report::write_comm_report` writes the integrated `report.md`;
 `report::finalize_report_assets` then generates the SVG figures and the
-per-user PageRank CSV, appending a `## 図表` section to the report．Pass an
-[`Anonymizer`](ethics.md) so that no raw platform user ID leaks into any
-output．
+per-user PageRank CSV, appending a `## 図表` (Figures) section to the report.
+Pass an [`Anonymizer`](ethics.md) so that no raw platform user ID leaks into
+any output.
 
 ```rust
 use std::path::Path;
@@ -196,5 +198,5 @@ println!("generated {} assets", assets.len());
 ```
 
 The only per-user artifact (`tables/h3_pagerank.csv`) is anonymized unless you
-explicitly disable it．The runtime audit guarantees no raw ID leak — see
-[Ethics](ethics.md)．
+explicitly disable it. The runtime audit guarantees no raw ID leak — see
+[Ethics](ethics.md).

@@ -1,14 +1,16 @@
+**English** | [日本語](../ja/nlp.md)
+
 # NLP backend
 
 NLP runs in-process via [candle](https://github.com/huggingface/candle) — no
-Python, no subprocess．
+Python, no subprocess.
 
-See also：[Use cases](use-cases.md) ／ [Hypotheses](hypotheses.md) ／
-[Architecture](architecture.md)．
+See also: [Use cases](use-cases.md) / [Hypotheses](hypotheses.md) /
+[Architecture](architecture.md).
 
 ## The `Nlp` trait
 
-All enrichment goes through the `Nlp` trait：
+All enrichment goes through the `Nlp` trait:
 
 ```rust
 pub trait Nlp {
@@ -21,15 +23,15 @@ pub trait Nlp {
 }
 ```
 
-Two implementations ship：
+Two implementations ship:
 
-* **`MockNlp`** — deterministic, dependency-free, **always available**．It
+* **`MockNlp`** — deterministic, dependency-free, **always available**. It
   reproduces the historical mock contract byte-for-byte and is used by the
-  test suite / CI (no models, no network)．Ideal for offline and reproducible
-  runs．
-* **`CandleNlp`** — feature `nlp` (default on)．Real Japanese inference，
-  constructed with `CandleNlp::new(&cfg.nlp)?`．Models load lazily on first
-  use．
+  test suite / CI (no models, no network). Ideal for offline and reproducible
+  runs.
+* **`CandleNlp`** — feature `nlp` (default on). Real Japanese inference,
+  constructed with `CandleNlp::new(&cfg.nlp)?`. Models load lazily on first
+  use.
 
 ## Model table
 
@@ -42,11 +44,11 @@ Two implementations ship：
 | clustering | HDBSCAN | `petal-clustering` |
 
 `LUKE`-WRIME (the original sentiment pick) was dropped — its entity-aware
-attention has no candle implementation；BERT-WRIME replaces it．
+attention has no candle implementation; BERT-WRIME replaces it.
 
 ## Model profiles & weights
 
-`cfg.nlp.profile` selects `fast` / `balanced` (default) / `quality`：
+`cfg.nlp.profile` selects `fast` / `balanced` (default) / `quality`:
 
 | Profile | Embedding | Stance |
 |---------|-----------|--------|
@@ -54,30 +56,30 @@ attention has no candle implementation；BERT-WRIME replaces it．
 | `balanced` | `cl-nagoya/ruri-v3-130m` | NLI |
 | `quality` | `cl-nagoya/ruri-v3-310m` | LLM (Sarashina2.2-3b) |
 
-Real-model inference needs HuggingFace weights，which are **auto-downloaded**
+Real-model inference needs HuggingFace weights, which are **auto-downloaded**
 to `~/.cache/huggingface` on first use (honouring `HF_HOME` and
-`HF_HUB_OFFLINE`)，or pre-fetched via `nlp::download::download_models` /
-`nlp::download::download_all`．The test suite never loads real weights — all
-tests use `MockNlp`，and the one real-model smoke test is `#[ignore]`d．
+`HF_HUB_OFFLINE`), or pre-fetched via `nlp::download::download_models` /
+`nlp::download::download_all`. The test suite never loads real weights — all
+tests use `MockNlp`, and the one real-model smoke test is `#[ignore]`d.
 
 ## Build & runtime notes
 
-* This build compiles the **CPU** candle backend only．GPU (`metal` / `cuda`)
-  can be enabled later via candle's own features．
+* This build compiles the **CPU** candle backend only. GPU (`metal` / `cuda`)
+  can be enabled later via candle's own features.
 * Long LLM inference (the `quality` profile) should be wrapped in
   `tokio::task::spawn_blocking` by an async caller — the `enrich_*` functions
-  are synchronous．
-* Lightweight builds without NLP：`--no-default-features --features lindera`．
+  are synchronous.
+* Lightweight builds without NLP: `--no-default-features --features lindera`.
 
 ## Morphology
 
-`compute_h5` (monthly novel-vocabulary rate) takes a `&dyn Morphology`．Two
-implementations ship：
+`compute_h5` (monthly novel-vocabulary rate) takes a `&dyn Morphology`. Two
+implementations ship:
 
-* **`WhitespaceMorphology`** — always available．Splits on ASCII whitespace．
-* **`LinderaMorphology`** — feature `lindera` (default on)．Japanese noun
-  extraction via lindera + IPADIC，with a character-class fallback when the
-  dictionary is unavailable．
+* **`WhitespaceMorphology`** — always available. Splits on ASCII whitespace.
+* **`LinderaMorphology`** — feature `lindera` (default on). Japanese noun
+  extraction via lindera + IPADIC, with a character-class fallback when the
+  dictionary is unavailable.
 
 The crate compiles **without** the `lindera` feature too — use
-`--no-default-features` for builds that can't bring in lindera．
+`--no-default-features` for builds that can't bring in lindera.

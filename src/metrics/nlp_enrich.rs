@@ -1,12 +1,14 @@
-//! NLP enrichment: fill the H1/H4/H5 metric fields that need the Python sidecar．
+//! NLP enrichment: fill the H1/H4/H5 metric fields that need a model backend．
 //!
-//! `compute_h1` / `compute_h4` / `compute_h5` stay sync and Rust-only．These
-//! async functions run *after* them, when a sidecar is available, and populate
-//! the embedding / sentiment / clustering dependent fields．
+//! `compute_h1` / `compute_h4` / `compute_h5` stay Rust-only．These functions
+//! run *after* them, given an [`Nlp`] backend, and populate the embedding /
+//! sentiment / stance / clustering dependent fields．They are **synchronous**:
+//! the candle backend runs inference in-process. Wrap long LLM inference in
+//! `tokio::task::spawn_blocking` at the call site if running under async.
 //!
-//! **Graceful degradation**: any sidecar / IO error is logged with
-//! `tracing::warn!` and the affected field is left untouched．Enrichment never
-//! returns an error that would abort the whole analysis run．
+//! **Graceful degradation**: any backend error is logged with `tracing::warn!`
+//! and the affected field is left untouched．Enrichment never returns an error
+//! that would abort the whole analysis run (it always returns `Ok(())`)．
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -15,7 +17,7 @@ use chrono::{DateTime, Utc};
 use crate::analysis::{group_threads, timestamp_secs_f64};
 use crate::error::Result;
 use crate::models::{ChannelCategory, H1Metrics, H4Metrics, H5Metrics};
-use crate::nlp_sidecar::{NlpRequest, NlpResponse, NlpSidecar};
+use crate::nlp::{Nlp, StanceLabel};
 use crate::types::{AnalysisInput, Message};
 
 /// Emoji names treated as "agreement" reactions (mirrors H3's set)．
@@ -103,32 +105,11 @@ fn month_bucket(t: DateTime<Utc>) -> String {
     t.format("%Y-%m").to_string()
 }
 
-async fn polarities(sc: &mut NlpSidecar, texts: &[String]) -> Result<Vec<f64>> {
-    if texts.is_empty() {
-        return Ok(Vec::new());
-    }
-    let reqs: Vec<NlpRequest> = texts
-        .iter()
-        .enumerate()
-        .map(|(i, t)| NlpRequest::Sentiment {
-            id: i.to_string(),
-            text: t.clone(),
-        })
-        .collect();
-    let resps = sc.batch_request(reqs).await?;
-    let mut out = Vec::with_capacity(resps.len());
-    for r in resps {
-        match r {
-            NlpResponse::Sentiment { polarity, .. } => out.push(polarity as f64),
-            NlpResponse::Error { message, .. } => {
-                return Err(crate::error::CommError::Nlp(message))
-            }
-            other => {
-                return Err(crate::error::CommError::Nlp(format!(
-                    "unexpected sentiment response: {other:?}"
-                )))
-            }
-        }
+/// Sentiment polarities for a batch of texts (one `nlp.sentiment` call each)．
+fn polarities(nlp: &dyn Nlp, texts: &[String]) -> Result<Vec<f64>> {
+    let mut out = Vec::with_capacity(texts.len());
+    for t in texts {
+        out.push(nlp.sentiment(t)?.polarity as f64);
     }
     Ok(out)
 }
@@ -146,15 +127,10 @@ fn category_of(input: &AnalysisInput<'_>, cid: &str) -> ChannelCategory {
 /// Enrich H4 NLP-dependent fields: `public_private_sentiment_delta`,
 /// `reaction_text_disagreement`．
 ///
-/// `reaction_text_disagreement`: GENERALIZED — previously parsed Slack
-/// `raw_json` for reactions; now iterates `input.reactions` to find messages
+/// `reaction_text_disagreement`: iterates `input.reactions` to find messages
 /// that received an agreement-emoji reaction, then scores their text．Rate
 /// = (#scored with polarity < −0.1) / (#scored)．
-pub async fn enrich_h4(
-    input: &AnalysisInput<'_>,
-    sc: &mut NlpSidecar,
-    m: &mut H4Metrics,
-) -> Result<()> {
+pub fn enrich_h4(input: &AnalysisInput<'_>, nlp: &dyn Nlp, m: &mut H4Metrics) -> Result<()> {
     // --- public_private_sentiment_delta ---
     let public: Vec<&Message> = input
         .messages
@@ -181,10 +157,7 @@ pub async fn enrich_h4(
             .iter()
             .map(|m| m.text.clone())
             .collect();
-        match (
-            polarities(sc, &pub_texts).await,
-            polarities(sc, &cas_texts).await,
-        ) {
+        match (polarities(nlp, &pub_texts), polarities(nlp, &cas_texts)) {
             (Ok(p), Ok(c)) => {
                 if let (Some(pm), Some(cm)) = (mean(&p), mean(&c)) {
                     m.public_private_sentiment_delta = Some(pm - cm);
@@ -196,7 +169,7 @@ pub async fn enrich_h4(
         }
     }
 
-    // --- reaction_text_disagreement (GENERALIZED to use &[Reaction]) ---
+    // --- reaction_text_disagreement ---
     let reacted_ids = agreement_reacted_ids(input);
     let reacted: Vec<&Message> = input
         .messages
@@ -205,7 +178,7 @@ pub async fn enrich_h4(
         .collect();
     if !reacted.is_empty() {
         let texts: Vec<String> = reacted.iter().map(|m| m.text.clone()).collect();
-        match polarities(sc, &texts).await {
+        match polarities(nlp, &texts) {
             Ok(p) if !p.is_empty() => {
                 let neg = p.iter().filter(|&&x| x < -0.1).count();
                 m.reaction_text_disagreement = Some(neg as f64 / p.len() as f64);
@@ -244,12 +217,8 @@ const REGRESSION_SIM_THRESHOLD: f32 = 0.7;
 const REGRESSION_DIVERGE_THRESHOLD: f32 = 0.5;
 const STANCE_CALL_CAP: usize = 800;
 
-/// Enrich H1 NLP-dependent fields using the sidecar．
-pub async fn enrich_h1(
-    input: &AnalysisInput<'_>,
-    sc: &mut NlpSidecar,
-    m: &mut H1Metrics,
-) -> Result<()> {
+/// Enrich H1 NLP-dependent fields using the backend．
+pub fn enrich_h1(input: &AnalysisInput<'_>, nlp: &dyn Nlp, m: &mut H1Metrics) -> Result<()> {
     let groups = group_threads(input.messages);
 
     // --- decision_change_rate ---
@@ -265,14 +234,8 @@ pub async fn enrich_h1(
         for g in &qualifying {
             let first = g.messages.first().unwrap().text.clone();
             let last = g.messages.last().unwrap().text.clone();
-            match sc
-                .request(NlpRequest::Embed {
-                    id: g.thread_key.clone(),
-                    texts: vec![first, last],
-                })
-                .await
-            {
-                Ok(NlpResponse::Embed { vectors, .. }) if vectors.len() >= 2 => {
+            match nlp.embed(&[first, last]) {
+                Ok(vectors) if vectors.len() >= 2 => {
                     counted += 1;
                     if cosine(&vectors[0], &vectors[1]) < CHANGE_SIM_THRESHOLD {
                         changed += 1;
@@ -304,14 +267,8 @@ pub async fn enrich_h1(
         for g in &regress_threads {
             let n = g.messages.len();
             let texts: Vec<String> = g.messages.iter().map(|m| m.text.clone()).collect();
-            let embeds = match sc
-                .request(NlpRequest::Embed {
-                    id: g.thread_key.clone(),
-                    texts,
-                })
-                .await
-            {
-                Ok(NlpResponse::Embed { vectors, .. }) if vectors.len() == n => vectors,
+            let embeds = match nlp.embed(&texts) {
+                Ok(vectors) if vectors.len() == n => vectors,
                 Ok(_) => continue,
                 Err(e) => {
                     tracing::warn!(error = %e, "enrich_h1: regression embed degraded");
@@ -354,20 +311,12 @@ pub async fn enrich_h1(
                 break 'threads;
             }
             stance_budget -= 1;
-            match sc
-                .request(NlpRequest::Stance {
-                    id: msg.id.clone(),
-                    text: msg.text.clone(),
-                    context: root_text.clone(),
-                })
-                .await
-            {
-                Ok(NlpResponse::Stance { label, .. }) => {
-                    if label == "disagree" {
+            match nlp.stance(&msg.text, root_text.as_deref()) {
+                Ok(stance) => {
+                    if stance.label == StanceLabel::Disagree {
                         dissent_ts.push(timestamp_secs_f64(msg.timestamp));
                     }
                 }
-                Ok(_) => {}
                 Err(e) => {
                     tracing::warn!(error = %e, "enrich_h1: stance refinement degraded");
                     stance_degraded = true;
@@ -397,11 +346,7 @@ pub async fn enrich_h1(
 
 /// Enrich H5 NLP-dependent fields: `proposal_semantic_diversity`,
 /// `topic_cluster_count_monthly`．
-pub async fn enrich_h5(
-    input: &AnalysisInput<'_>,
-    sc: &mut NlpSidecar,
-    m: &mut H5Metrics,
-) -> Result<()> {
+pub fn enrich_h5(input: &AnalysisInput<'_>, nlp: &dyn Nlp, m: &mut H5Metrics) -> Result<()> {
     let is_proposal = |t: &str| PROPOSAL_CUES.iter().any(|c| t.contains(c));
     let groups = group_threads(input.messages);
     let mut thread_diversities: Vec<f64> = Vec::new();
@@ -411,12 +356,8 @@ pub async fn enrich_h5(
             continue;
         }
         let texts: Vec<String> = proposals.iter().map(|m| m.text.clone()).collect();
-        let req = NlpRequest::Embed {
-            id: g.thread_key.clone(),
-            texts,
-        };
-        match sc.request(req).await {
-            Ok(NlpResponse::Embed { vectors, .. }) if vectors.len() >= 2 => {
+        match nlp.embed(&texts) {
+            Ok(vectors) if vectors.len() >= 2 => {
                 if let Some(div) = covariance_trace(&vectors) {
                     thread_diversities.push(div);
                 }
@@ -431,7 +372,7 @@ pub async fn enrich_h5(
         m.proposal_semantic_diversity = Some(avg);
     }
 
-    let min_cluster_size = (input.config.nlp_sidecar.embed_batch_size / 8).max(2);
+    let min_cluster_size = (input.config.nlp.embed_batch_size / 8).max(2);
     let mut by_month: BTreeMap<String, Vec<&Message>> = BTreeMap::new();
     for msg in input.messages {
         let mk = month_bucket(msg.timestamp);
@@ -444,31 +385,15 @@ pub async fn enrich_h5(
         }
         let sample = capped_by_ts(msgs, CLUSTER_SAMPLE_CAP);
         let texts: Vec<String> = sample.iter().map(|m| m.text.clone()).collect();
-        let embeds = match sc
-            .request(NlpRequest::Embed {
-                id: month.clone(),
-                texts,
-            })
-            .await
-        {
-            Ok(NlpResponse::Embed { vectors, .. }) => vectors,
-            Ok(_) => continue,
+        let embeds = match nlp.embed(&texts) {
+            Ok(vectors) => vectors,
             Err(e) => {
                 tracing::warn!(error = %e, month = %month, "enrich_h5: month embed skipped");
                 continue;
             }
         };
-        match sc
-            .request(NlpRequest::Cluster {
-                embeddings: embeds,
-                min_cluster_size,
-            })
-            .await
-        {
-            Ok(NlpResponse::Cluster { num_clusters, .. }) => {
-                monthly.push((month.clone(), num_clusters));
-            }
-            Ok(_) => {}
+        match nlp.cluster(&embeds, min_cluster_size) {
+            Ok(res) => monthly.push((month.clone(), res.num_clusters)),
             Err(e) => {
                 tracing::warn!(error = %e, month = %month, "enrich_h5: month cluster skipped");
             }
@@ -505,28 +430,9 @@ mod tests {
     use super::*;
     use crate::config::{ChannelEntry, CommConfig};
     use crate::models::SilenceRatio;
+    use crate::nlp::MockNlp;
     use crate::types::{Channel, Reaction};
     use chrono::TimeZone;
-
-    fn sidecar_path() -> String {
-        // CARGO_MANIFEST_DIR = <repo>/  (single crate; no workspace layer).
-        let manifest = env!("CARGO_MANIFEST_DIR");
-        std::path::Path::new(manifest)
-            .join("tools/comm/src/nlp_sidecar.py")
-            .to_string_lossy()
-            .into_owned()
-    }
-
-    fn python3() -> Option<String> {
-        let out = std::process::Command::new("which").arg("python3").output();
-        match out {
-            Ok(o) if o.status.success() => {
-                let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                (!p.is_empty()).then_some(p)
-            }
-            _ => None,
-        }
-    }
 
     fn ts(s: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(s, 0).single().unwrap()
@@ -616,15 +522,8 @@ mod tests {
         assert!(!ids.contains("M3"));
     }
 
-    #[tokio::test]
-    async fn test_enrich_h4_h5_with_mock_sidecar() {
-        let py = match python3() {
-            Some(p) => p,
-            None => {
-                eprintln!("skip: python3 not found");
-                return;
-            }
-        };
+    #[test]
+    fn test_enrich_h4_h5_with_mock() {
         let cfg = cfg_with_channels();
         let channels = vec![channel("C_OFF", "proj-x"), channel("C_CAS", "times-foo")];
 
@@ -649,7 +548,6 @@ mod tests {
                 None,
             ));
         }
-        // Agreement-reacted message for reaction_text_disagreement.
         messages.push(msg(
             "C_OFF",
             "M_REACT",
@@ -686,8 +584,7 @@ mod tests {
             config: &cfg,
         };
 
-        let args = vec![sidecar_path(), "--mock".to_string()];
-        let mut sc = NlpSidecar::spawn_cmd(&py, &args).await.expect("spawn mock");
+        let nlp = MockNlp;
 
         let mut h4 = H4Metrics {
             surface_agreement_rate: 0.0,
@@ -696,9 +593,7 @@ mod tests {
             execution_delay_hours: 0.0,
             reaction_text_disagreement: None,
         };
-        enrich_h4(&input, &mut sc, &mut h4)
-            .await
-            .expect("enrich_h4 ok");
+        enrich_h4(&input, &nlp, &mut h4).expect("enrich_h4 ok");
         let d = h4.public_private_sentiment_delta.expect("delta Some");
         assert!((-2.0..=2.0).contains(&d));
         let r = h4
@@ -713,17 +608,16 @@ mod tests {
             novel_vocabulary_rate_monthly: Vec::new(),
             topic_cluster_count_monthly: None,
         };
-        enrich_h5(&input, &mut sc, &mut h5)
-            .await
-            .expect("enrich_h5 ok");
+        enrich_h5(&input, &nlp, &mut h5).expect("enrich_h5 ok");
         let div = h5.proposal_semantic_diversity.expect("diversity Some");
         assert!(div >= 0.0);
         let monthly = h5
             .topic_cluster_count_monthly
             .expect("monthly clusters Some");
         assert!(!monthly.is_empty());
-
-        sc.shutdown().await.expect("shutdown ok");
+        for (_, k) in &monthly {
+            assert!(*k >= 1);
+        }
     }
 
     #[test]
@@ -734,15 +628,8 @@ mod tests {
         assert!((c - 1.0).abs() < 1e-6);
     }
 
-    #[tokio::test]
-    async fn test_enrich_h1_with_mock_sidecar() {
-        let py = match python3() {
-            Some(p) => p,
-            None => {
-                eprintln!("skip: python3 not found");
-                return;
-            }
-        };
+    #[test]
+    fn test_enrich_h1_with_mock() {
         let cfg = CommConfig::default();
 
         let r1 = "M_R1";
@@ -791,8 +678,7 @@ mod tests {
             config: &cfg,
         };
 
-        let args = vec![sidecar_path(), "--mock".to_string()];
-        let mut sc = NlpSidecar::spawn_cmd(&py, &args).await.expect("spawn mock");
+        let nlp = MockNlp;
 
         let mut h1 = H1Metrics {
             decision_change_rate: 0.0,
@@ -805,15 +691,11 @@ mod tests {
             dissent_convergence_speed_minutes: 42.0,
             thread_count: 2,
         };
-        enrich_h1(&input, &mut sc, &mut h1)
-            .await
-            .expect("enrich_h1 ok");
+        enrich_h1(&input, &nlp, &mut h1).expect("enrich_h1 ok");
 
         assert!((0.0..=1.0).contains(&h1.decision_change_rate));
         assert!((0.0..=1.0).contains(&h1.initial_proposal_regression));
-        // Mock stance is always "neutral" => the pre-set sentinel is retained.
+        // Mock stance is always Neutral => the pre-set sentinel is retained.
         assert!((h1.dissent_convergence_speed_minutes - 42.0).abs() < 1e-9);
-
-        sc.shutdown().await.expect("shutdown ok");
     }
 }

@@ -4,8 +4,9 @@ In-memory stateless library for organizational / community communication
 analysis．Computes five-hypothesis health metrics (**H1** exploration-vs-
 justification ／ **H2** psychological safety ／ **H3** power gradient ／
 **H4** pseudo-consensus ／ **H5** exploration / idea diversity) over slices of
-platform-agnostic chat data．Japanese-focused NLP via an optional Python
-sidecar．
+platform-agnostic chat data．Japanese-focused NLP via in-process
+[candle](https://github.com/huggingface/candle) inference (feature `nlp`,
+default on)．
 
 The library is platform-agnostic：it takes `Vec<Message>` / `Vec<Channel>` /
 `Vec<User>` / `Vec<Reaction>` directly and never touches a database or a
@@ -90,28 +91,57 @@ email addresses, … all work．
 
 H1 の埋め込み依存フィールドと H4/H5 の sentiment / クラスタリング依存フィー
 ルドは Rust-only の `compute_h*` では計算されず，`None` / `0.0` のまま残る．
-NLP サイドカー稼働時のみ [`enrich_h1`] / [`enrich_h4`] / [`enrich_h5`] が
-それらを上書きする．
+NLP バックエンド供給時のみ [`enrich_h1`] / [`enrich_h4`] / [`enrich_h5`] が
+それらを上書きする．これらは **同期** 関数で，`&dyn Nlp` を受け取る．
 
-## Optional NLP sidecar
+## NLP backend
 
-The `tools/comm/` Python sidecar provides Japanese sentiment / stance /
-embedding / clustering．Setup（GB-scale ML deps；only when needed）：
+NLP is in-process via candle (no Python, no subprocess)．The [`Nlp`] trait has
+two implementations：
 
-```bash
-cd tools/comm
-uv sync
-uv run python scripts/download_models.py --profile balanced  # fast / balanced / quality / all
+* [`MockNlp`] — deterministic, dependency-free, **always available**．
+  Reproduces the historical mock contract byte-for-byte；used by the test
+  suite / CI (no models, no network)．
+* [`CandleNlp`] — feature `nlp` (default on)．Real Japanese inference：
+
+  | task | model | candle backbone |
+  |------|-------|-----------------|
+  | embedding | Ruri v3 (ModernBERT-Ja) | `models::modernbert` |
+  | sentiment | BERT-WRIME (`Mizuiro-sakura/bert-base-japanese-v2-wrime-fine-tune`) | `models::bert` |
+  | stance (NLI) | `Formzu/bert-base-japanese-jsnli` | `models::bert` |
+  | stance (LLM, `quality`) | Sarashina2.2-3b | `models::llama` (TODO) |
+  | clustering | HDBSCAN | `petal-clustering` |
+
+  `LUKE`-WRIME (the original sentiment pick) was dropped — its entity-aware
+  attention has no candle implementation；BERT-WRIME replaces it．
+
+```rust,ignore
+use community_analyzer::{CandleNlp, MockNlp, enrich_h1};
+
+// Tests / CI — deterministic, offline:
+let nlp = MockNlp;
+enrich_h1(&input, &nlp, &mut h1)?;
+
+// Production — real candle inference (feature `nlp`):
+let nlp = CandleNlp::new(&cfg.nlp)?;          // models load lazily on first use
+enrich_h1(&input, &nlp, &mut h1)?;
 ```
 
-Profiles select model size (cf. `tools/comm/README.md`)．For CI / tests，
-**`--mock` mode** uses Python stdlib only and returns deterministic values：
+### Model profiles & weights
 
-```bash
-python3 tools/comm/src/nlp_sidecar.py --mock
-```
+`cfg.nlp.profile` selects `fast` / `balanced` (default) / `quality`．Real-model
+inference needs HuggingFace weights — these are **auto-downloaded** to
+`~/.cache/huggingface` on first use (honouring `HF_HOME` / `HF_HUB_OFFLINE`)，
+or pre-fetched via [`nlp::download::download_models`] /
+[`nlp::download::download_all`]．**The test suite never loads real weights**：
+all tests use `MockNlp`，and the one real-model smoke test is `#[ignore]`d．
 
-The Rust integration tests use this `--mock` contract verbatim．
+This build compiles the **CPU** candle backend only．GPU (`metal` / `cuda`)
+can be enabled later via candle's own features．Long LLM inference (the
+`quality` profile) should be wrapped in `tokio::task::spawn_blocking` by an
+async caller — the `enrich_*` functions are synchronous．
+
+Lightweight builds without NLP：`--no-default-features --features lindera`．
 
 ## Morphology
 

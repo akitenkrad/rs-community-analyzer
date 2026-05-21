@@ -6,8 +6,9 @@
 use chrono::{DateTime, Duration, TimeZone, Utc};
 
 use community_analyzer::{
-    build_summary, compute_h1, compute_h2, compute_h3, compute_h4, compute_h5, AnalysisInput,
-    Channel, ChannelCategory, CommConfig, Message, Reaction, Role, User, WhitespaceMorphology,
+    build_summary, compute_h1, compute_h2, compute_h3, compute_h4, compute_h5, enrich_h1,
+    enrich_h4, enrich_h5, AnalysisInput, Channel, ChannelCategory, CommConfig, Message, MockNlp,
+    Reaction, Role, User, WhitespaceMorphology,
 };
 
 fn ts(secs: i64) -> DateTime<Utc> {
@@ -412,11 +413,19 @@ fn main() {
 
     let morph = WhitespaceMorphology;
 
-    let h1 = compute_h1(&input).expect("compute_h1");
+    let mut h1 = compute_h1(&input).expect("compute_h1");
     let h2 = compute_h2(&input).expect("compute_h2");
     let h3 = compute_h3(&input).expect("compute_h3");
-    let h4 = compute_h4(&input).expect("compute_h4");
-    let h5 = compute_h5(&input, &morph).expect("compute_h5");
+    let mut h4 = compute_h4(&input).expect("compute_h4");
+    let mut h5 = compute_h5(&input, &morph).expect("compute_h5");
+
+    // NLP enrichment via the deterministic MockNlp backend (no models/network).
+    // In production, construct `CandleNlp::new(&cfg.nlp)?` under feature `nlp`.
+    let nlp = MockNlp;
+    enrich_h1(&input, &nlp, &mut h1).expect("enrich_h1");
+    enrich_h4(&input, &nlp, &mut h4).expect("enrich_h4");
+    enrich_h5(&input, &nlp, &mut h5).expect("enrich_h5");
+
     let summary = build_summary(Some(&h1), Some(&h2), Some(&h3), Some(&h4), Some(&h5));
 
     println!("=== community-analyzer basic example ===");

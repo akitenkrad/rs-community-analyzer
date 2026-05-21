@@ -4,15 +4,28 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 authors = ["akitenkrad"]
-description = "In-memory stateless library for organizational/community communication analysis (H1-H5 hypotheses; Japanese NLP via optional Python sidecar). Extracted from persona-from-slack."
+description = "In-memory stateless library for organizational/community communication analysis (H1-H5 hypotheses; Japanese NLP via optional in-process candle inference). Extracted from persona-from-slack."
 readme = "README.md"
 repository = ""
 keywords = ["analysis", "slack", "collaboration", "japanese", "communication"]
 categories = ["text-processing", "science"]
 
 [features]
-default = ["lindera"]
+default = ["lindera", "nlp"]
 lindera = ["dep:lindera"]
+# `nlp` enables in-process candle inference (Ruri v3 embedding, BERT-WRIME
+# sentiment, JSNLI-BERT / Sarashina2.2 stance) plus HDBSCAN clustering.
+nlp = [
+    "dep:candle-core",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:hf-hub",
+    "dep:safetensors",
+    "dep:petal-clustering",
+    "dep:annembed",
+    "dep:ndarray",
+]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -30,10 +43,21 @@ rand = "0.8"
 rand_chacha = "0.3"
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
-tokio = { version = "1", features = ["full"] }
 lindera = { version = "0.33", optional = true }
 unicode-normalization = "0.1"
+once_cell = "1"
+
+# Candle ML stack (feature `nlp`). CPU backend only this session; the candle
+# `metal` / `cuda` features can be wired in later for GPU inference.
+candle-core = { version = "0.10", optional = true }
+candle-nn = { version = "0.10", optional = true }
+candle-transformers = { version = "0.10", optional = true }
+tokenizers = { version = "0.21", optional = true, default-features = false, features = ["onig"] }
+hf-hub = { version = "0.3", optional = true }
+safetensors = { version = "0.6", optional = true }
+petal-clustering = { version = "0.13", optional = true }
+annembed = { version = "0.1", optional = true }
+ndarray = { version = "0.17", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { version = "1", features = ["full"] }

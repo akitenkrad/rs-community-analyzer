@@ -19,7 +19,7 @@ pub struct CommConfig {
     #[serde(default)]
     pub patterns: PatternDict,
     #[serde(default)]
-    pub nlp_sidecar: NlpSidecarConfig,
+    pub nlp: NlpConfig,
     #[serde(default)]
     pub output: OutputConfig,
 }
@@ -146,10 +146,6 @@ fn d_true() -> bool {
     true
 }
 
-fn d_py() -> String {
-    "uv run python".to_string()
-}
-
 fn d_balanced() -> String {
     "balanced".to_string()
 }
@@ -158,19 +154,47 @@ fn d_32() -> usize {
     32
 }
 
-/// Python NLP sidecar configuration．
+/// Inference profile selecting the model trade-off (size vs. quality)．
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Profile {
+    /// Smallest models — CI / quick checks．
+    Fast,
+    /// Default balance for normal operation．
+    #[default]
+    Balanced,
+    /// Largest models incl． LLM stance — final reports．
+    Quality,
+}
+
+impl Profile {
+    /// Parse a profile string (case-insensitive)，falling back to [`Profile::Balanced`]．
+    pub fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fast" => Self::Fast,
+            "quality" => Self::Quality,
+            _ => Self::Balanced,
+        }
+    }
+}
+
+/// In-process candle NLP configuration．
+///
+/// (Renamed from `NlpSidecarConfig`; the Python sidecar is gone — inference now
+/// happens in-process via candle when the `nlp` feature is enabled.)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NlpSidecarConfig {
+pub struct NlpConfig {
+    /// When false the caller should skip NLP enrichment entirely (`--no-nlp`)．
     #[serde(default = "d_true")]
     pub enabled: bool,
-    #[serde(default = "d_py")]
-    pub python: String,
-    #[serde(default)]
-    pub script: String,
+    /// One of `fast` / `balanced` / `quality`．
     #[serde(default = "d_balanced")]
     pub profile: String,
+    /// candle device hint (`""` / `cpu` / `metal` / `cuda`)．CPU is used unless
+    /// the corresponding candle feature is compiled in (none this session)．
     #[serde(default)]
     pub device: String,
+    /// Batch size for embedding inference．
     #[serde(default = "d_32")]
     pub embed_batch_size: usize,
     #[serde(default)]
@@ -179,18 +203,33 @@ pub struct NlpSidecarConfig {
     pub models: NlpModels,
 }
 
-impl Default for NlpSidecarConfig {
+impl Default for NlpConfig {
     fn default() -> Self {
         Self {
             enabled: d_true(),
-            python: d_py(),
-            script: String::new(),
             profile: d_balanced(),
             device: String::new(),
             embed_batch_size: d_32(),
             ruri_prefix: RuriPrefix::default(),
             models: NlpModels::default(),
         }
+    }
+}
+
+impl NlpConfig {
+    /// Parsed [`Profile`] from the `profile` string field．
+    pub fn profile(&self) -> Profile {
+        Profile::parse(&self.profile)
+    }
+
+    /// The resolved [`ModelSet`] for the active profile, or built-in defaults．
+    pub fn model_set(&self) -> ModelSet {
+        let from_cfg = match self.profile() {
+            Profile::Fast => self.models.fast.clone(),
+            Profile::Balanced => self.models.balanced.clone(),
+            Profile::Quality => self.models.quality.clone(),
+        };
+        from_cfg.unwrap_or_else(|| ModelSet::default_for(self.profile()))
     }
 }
 
@@ -220,10 +259,36 @@ pub struct ModelSet {
     pub sentiment: String,
     #[serde(default)]
     pub stance: String,
+    /// `"nli"` (default) or `"llm"`．
     #[serde(default)]
     pub stance_mode: String,
     #[serde(default)]
     pub stance_llm: String,
+}
+
+impl ModelSet {
+    /// Built-in HuggingFace model ids per profile (design §6.5)．
+    ///
+    /// Sentiment is BERT-WRIME for every profile (LUKE-WRIME was dropped — its
+    /// entity-aware attention has no candle implementation)．
+    pub fn default_for(profile: Profile) -> Self {
+        let (embedding, stance_mode, stance_llm) = match profile {
+            Profile::Fast => ("cl-nagoya/ruri-v3-30m", "nli", ""),
+            Profile::Balanced => ("cl-nagoya/ruri-v3-130m", "nli", ""),
+            Profile::Quality => (
+                "cl-nagoya/ruri-v3-310m",
+                "llm",
+                "sbintuitions/sarashina2.2-3b-instruct-v0.1",
+            ),
+        };
+        Self {
+            embedding: embedding.to_string(),
+            sentiment: "Mizuiro-sakura/bert-base-japanese-v2-wrime-fine-tune".to_string(),
+            stance: "Formzu/bert-base-japanese-jsnli".to_string(),
+            stance_mode: stance_mode.to_string(),
+            stance_llm: stance_llm.to_string(),
+        }
+    }
 }
 
 fn d_outdir() -> String {
@@ -368,18 +433,17 @@ hedging = ["仮説ですが", "とりあえず"]
 self_defense = ["違ったらすみません"]
 surface_agreement = ["承知しました", "👍"]
 
-[nlp_sidecar]
+[nlp]
 enabled = true
-python  = "uv run python"
 profile = "balanced"
-device  = "mps"
+device  = "metal"
 embed_batch_size = 32
 
-[nlp_sidecar.ruri_prefix]
+[nlp.ruri_prefix]
 query   = "クエリ: "
 passage = "文章: "
 
-[nlp_sidecar.models.balanced]
+[nlp.models.balanced]
 embedding = "cl-nagoya/ruri-v3-130m"
 
 [output]
@@ -460,9 +524,9 @@ role    = "staff"
         assert!(!cfg.patterns.hedging.is_empty());
         assert!(cfg.patterns.incomplete.contains(&"えーと".to_string()));
         assert!(cfg.patterns.conclusion_marker.contains(&"結論".to_string()));
-        assert!(cfg.nlp_sidecar.enabled);
-        assert_eq!(cfg.nlp_sidecar.python, "uv run python");
-        assert_eq!(cfg.nlp_sidecar.embed_batch_size, 32);
+        assert!(cfg.nlp.enabled);
+        assert_eq!(cfg.nlp.profile, "balanced");
+        assert_eq!(cfg.nlp.embed_batch_size, 32);
         assert_eq!(cfg.output.dir, "output/comm");
         assert_eq!(cfg.output.top_n, 20);
         assert_eq!(cfg.period.fiscal.fiscal_year_start_month, 4);
@@ -485,5 +549,26 @@ role    = "lead"
         let f = write_tmp(with_extra);
         let cfg = CommConfig::load(f.path()).expect("load config with extra sections");
         assert_eq!(cfg.role_for("U1"), Role::Lead);
+    }
+
+    #[test]
+    fn test_profile_parse_and_model_defaults() {
+        assert_eq!(Profile::parse("FAST"), Profile::Fast);
+        assert_eq!(Profile::parse("quality"), Profile::Quality);
+        assert_eq!(Profile::parse("unknown"), Profile::Balanced);
+
+        let cfg = CommConfig::default();
+        assert_eq!(cfg.nlp.profile(), Profile::Balanced);
+        let ms = cfg.nlp.model_set();
+        assert_eq!(ms.embedding, "cl-nagoya/ruri-v3-130m");
+        assert_eq!(
+            ms.sentiment,
+            "Mizuiro-sakura/bert-base-japanese-v2-wrime-fine-tune"
+        );
+        assert_eq!(ms.stance_mode, "nli");
+
+        let q = ModelSet::default_for(Profile::Quality);
+        assert_eq!(q.stance_mode, "llm");
+        assert!(q.stance_llm.contains("sarashina"));
     }
 }

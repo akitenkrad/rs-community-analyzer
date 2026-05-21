@@ -9,7 +9,7 @@ pub mod graph;
 pub mod metrics;
 pub mod models;
 pub mod morphology;
-pub mod nlp_sidecar;
+pub mod nlp;
 pub mod report;
 pub mod text;
 pub mod types;
@@ -26,6 +26,8 @@ pub use models::*;
 #[cfg(feature = "lindera")]
 pub use morphology::LinderaMorphology;
 pub use morphology::{Morphology, WhitespaceMorphology};
-pub use nlp_sidecar::{NlpRequest, NlpResponse, NlpSidecar};
+#[cfg(feature = "nlp")]
+pub use nlp::CandleNlp;
+pub use nlp::{ClusterResult, MockNlp, Nlp, Sentiment, Stance, StanceLabel};
 pub use text::PatternMatcher;
 pub use types::{AnalysisInput, Channel, Message, Reaction, User};

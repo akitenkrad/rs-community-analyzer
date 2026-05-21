@@ -9,7 +9,7 @@ pub enum CommError {
     Config(String),
     #[error("Figment error: {0}")]
     Figment(String),
-    #[error("NLP sidecar error: {0}")]
+    #[error("NLP error: {0}")]
     Nlp(String),
     #[error("{0}")]
     Generic(String),
